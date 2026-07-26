@@ -1,0 +1,16 @@
+**/bin/
+**/obj/
+.git/
+.github/
+.env
+.env.*
+!.env.example
+TestResults/
+coverage/
+*.db
+docs/
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/playwright-report/
+frontend/test-results/

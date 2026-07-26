@@ -1,0 +1,202 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint, test, and build
+        run: npm run quality
+
+      - name: Audit npm dependencies
+        run: npm audit --audit-level=high
+
+  frontend-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run real-backend browser flow and accessibility scan
+        run: npm run e2e
+
+  build-test-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore Fulfillment.slnx
+
+      - name: Verify formatting
+        run: dotnet format Fulfillment.slnx --no-restore --verify-no-changes
+
+      - name: Build
+        run: dotnet build Fulfillment.slnx --configuration Release --no-restore
+
+      - name: Test
+        run: >
+          dotnet test Fulfillment.slnx
+          --configuration Release
+          --no-build
+          --collect:"XPlat Code Coverage"
+
+      - name: Verify documented development startup
+        run: |
+          sh scripts/run-development-api.sh > quick-start-api.log 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+          sh scripts/quick-start-smoke.sh
+
+      - name: Audit NuGet dependencies
+        run: |
+          python3 -m unittest discover tests/scripts
+          dotnet list Fulfillment.slnx package \
+            --vulnerable \
+            --include-transitive \
+            --no-restore \
+            --format json > nuget-audit.json
+          python3 scripts/verify_nuget_audit.py nuget-audit.json
+
+      - name: Build container
+        run: docker build --tag fulfillment-api:ci .
+
+  postgres-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: fulfillment
+          POSTGRES_USER: fulfillment
+          POSTGRES_PASSWORD: local-ci-password-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fulfillment -d fulfillment"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: http://localhost:8080
+      Database__Provider: Postgres
+      ConnectionStrings__Fulfillment: >-
+        Host=localhost;Port=5432;Database=fulfillment;
+        Username=fulfillment;Password=local-ci-password-only
+      POSTGRES_TEST_CONNECTION_STRING: >-
+        Host=localhost;Port=5432;Database=fulfillment;
+        Username=fulfillment;Password=local-ci-password-only
+      Authentication__Authority: https://identity.invalid
+      Authentication__Audience: fulfillment-api
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Apply migrations through the deployment command
+        run: >
+          dotnet run
+          --project src/Fulfillment.Api/Fulfillment.Api.csproj
+          --configuration Release
+          --no-launch-profile
+          -- --migrate
+
+      - name: Verify PostgreSQL persistence semantics
+        run: >
+          dotnet test
+          tests/Fulfillment.Api.IntegrationTests/Fulfillment.Api.IntegrationTests.csproj
+          --configuration Release
+          --filter "Category=Postgres"
+          --logger "trx;LogFileName=postgres.trx"
+
+      - name: Verify PostgreSQL test executed
+        run: >
+          python3 scripts/verify-postgres-test-results.py
+          tests/Fulfillment.Api.IntegrationTests/TestResults/postgres.trx
+
+      - name: Start API against PostgreSQL
+        run: |
+          dotnet run \
+            --project src/Fulfillment.Api/Fulfillment.Api.csproj \
+            --configuration Release > api.log 2>&1 &
+          echo $! > api.pid
+
+      - name: Verify readiness
+        run: sh scripts/postgres-smoke.sh
+
+      - name: Show API log on failure
+        if: failure()
+        run: cat api.log
+
+      - name: Stop API
+        if: always()
+        run: test ! -f api.pid || kill "$(cat api.pid)" || true
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
