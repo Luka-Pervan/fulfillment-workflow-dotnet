@@ -138,7 +138,7 @@ local database.
 ```bash
 TOKEN="$(
   sh scripts/create-dev-token.sh Supervisor |
-  jq -r '.accessToken'
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["accessToken"])'
 )"
 
 curl --fail --silent --show-error \
