@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A manual run makes Gitleaks scan the complete repository history.
+  workflow_dispatch:
 
 permissions:
   contents: read
